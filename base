@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""
+Advanced packet sniffer & TCP reassembler
+Author : LaziestTitan
+License: N/A
+"""
+import argparse, json, csv, os, sys, time, signal, threading, queue, traceback
+from scapy.all import *
+from scapy.layers.http import HTTPRequest, HTTPResponse   # pip install scapy-http
+from scapy.sessions import TCPSession                      # built-in re-assembly
+
+# ---------- CONFIG -------------------------------------------------
+DEFAULT snaplen = 65535
+DEFAULT promisc = True
+# -------------------------------------------------------------------
+
+class RotatingWriter:
+    """Thread-safe PCAP rotation when size limit reached"""
+    def __init__(self, basename, max_mb):
+        self.basename = basename
+        self.max_bytes = max_mb * 1024 * 1024
+        self.current = 0
+        self.lock = threading.Lock()
+        self._open()
+
+    def _open(self):
+        fname = f"{self.basename}-{int(time.time())}.pcap"
+        self.fd = PcapWriter(fname, sync=True)
+        self.bytes_written = 0
+        print(f"[+] opened {fname}")
+
+    def write(self, pkt):
+        with self.lock:
+            raw = raw(pkt)
+            self.fd.write(pkt)
+            self.bytes_written += len(raw)
+            if self.bytes_written > self.max_bytes:
+                self.fd.close()
+                self._open()
+
+class PrettyPrinter:
+    """Console sink – colourised summary"""
+    @staticmethod
+    def handle(pkt):
+        if IP in pkt:
+            ip = pkt[IP]
+            proto = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(ip.proto, str(ip.proto))
+            print(f"{ip.src:>15} → {ip.dst:<15}  {proto:>4}  len={len(pkt):>4}")
+
+class JSONExporter:
+    """Append each packet as JSON line"""
+    def __init__(self, fname):
+        self.f = open(fname, "a", buffering=1)
+
+    def handle(self, pkt):
+        self.f.write(pkt2dict(pkt) + "\n")
+
+    def close(self):
+        self.f.close()
+
+def pkt2dict(pkt):
+    """Flatten interesting fields to dict"""
+    d = {}
+    if IP in pkt:
+        ip = pkt[IP]
+        d.update({"ts": time.time(),
+                  "src": ip.src, "dst": ip.dst,
+                  "proto": ip.proto, "len": len(pkt)})
+    if TCP in pkt:
+        tcp = pkt[TCP]
+        d.update({"sport": tcp.sport, "dport": tcp.dport,
+                  "seq": tcp.seq, "ack": tcp.ack,
+                  "flags": tcp.flags})
+    if Raw in pkt:
+        d["payload"] = pkt[Raw].load[:128].hex()
+    return json.dumps(d)
+
+# ----------------- TCP STREAM REASSEMBLY ---------------------------
+class StreamHandler:
+    """Plugin-friendly TCP reassembler"""
+    def __init__(self):
+        self.seen = set()
+
+    def on_stream(self, sess, pkt):
+        """Called for every *assembled* pkt in correct order"""
+        if HTTPRequest in pkt:
+            http = pkt[HTTPRequest]
+            print(f"[HTTP] {pkt[IP].src}:{pkt[TCP].sport} "
+                  f"{http.Method.decode()} {http.Host.decode()}{http.Path.decode()}")
+        elif HTTPResponse in pkt:
+            print(f"[HTTP] {pkt[IP].src}:{pkt[TCP].sport} → "
+                  f"{pkt[IP].dst}:{pkt[TCP].dport} status={pkt[HTTPResponse].Status_Code}")
+
+# ----------------- SNIFFER CORE ------------------------------------
+class Sniffer:
+    def __init__(self, args):
+        self.args = args
+        self.writer = RotatingWriter(args.out, args.rotate) if args.rotate else None
+        self.exporter = JSONExporter(args.export) if args.export else None
+        self.streamer = StreamHandler() if args.reassemble else None
+        self.q = queue.Queue(maxsize=10000)
+        self.stop_evt = threading.Event()
+
+    def start(self):
+        # spawn worker threads
+        for _ in range(args.workers):
+            threading.Thread(target=self.worker, daemon=True).start()
+
+        # live capture
+        try:
+            sniff(iface=args.iface,
+                  filter=args.bpf,
+                  prn=self.q.put,
+                  store=False,
+                  session=TCPSession if self.streamer else None,
+                  stop_filter=lambda _: self.stop_evt.is_set())
+        except PermissionError:
+            print("[-] Need root/Administrator to sniff – exiting", file=sys.stderr)
+            sys.exit(2)
+
+    def worker(self):
+        while not self.stop_evt.is_set():
+            try:
+                pkt = self.q.get(timeout=.5)
+            except queue.Empty:
+                continue
+            try:
+                if self.writer:
+                    self.writer.write(pkt)
+                if self.exporter:
+                    self.exporter.handle(pkt)
+                if not self.args.quiet:
+                    PrettyPrinter.handle(pkt)
+                if self.streamer and TCP in pkt:
+                    self.streamer.on_stream(None, pkt)
+            except Exception as e:
+                traceback.print_exc()
+
+    def shutdown(self, sig, frame):
+        print("\n[*] shutting down…")
+        self.stop_evt.set()
+        if self.writer:
+            self.writer.fd.close()
+        if self.exporter:
+            self.exporter.close()
+        sys.exit(0)
+
+# ----------------- CLI ---------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Advanced Python packet sniffer")
+    p.add_argument("-i", "--iface", help="interface to sniff (default: all)")
+    p.add_argument("-f", "--bpf", default="", help="BPF filter string")
+    p.add_argument("-o", "--out", default="capture",
+                   help="base name for rotated PCAP files")
+    p.add_argument("--rotate", type=int, default=0,
+                   help="max MB per PCAP file before rotation")
+    p.add_argument("--export", help="append JSON lines to this file")
+    p.add_argument("--reassemble", action="store_true",
+                   help="enable TCP session reassembly (HTTP, etc.)")
+    p.add_argument("-w", "--workers", type=int, default=4,
+                   help="worker threads")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="suppress console output")
+    return p.parse_args()
+
+# ----------------- MAIN -------------------------------------------
+if __name__ == "__main__":
+    args = parse_args()
+    sniffer = Sniffer(args)
+    signal.signal(signal.SIGINT, sniffer.shutdown)
+    sniffer.start()
