@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+# ------------------------------------------------------------------------------
+#  adv_sniffer_plus.py  – same CLI as before, plus:
+#    --tlskey   FILE   RSA private key or NSS-key-log  → decrypt TLS 1.2/1.3
+#    --kafka    HOST   publish JSON to Kafka topic 'pcap'
+#    --async             use AsyncSniffer (faster >1 Gbps)
+#    --plugin   DIR      auto-load *.py parsers from DIR
+#    --sip               enable SIP reassembly plugin (example)
+# ------------------------------------------------------------------------------
+import os, sys, ssl, json, threading, importlib, pathlib, logging
+import asyncio, concurrent.futures
+from kafka import KafkaProducer                       # pip install kafka-python
+from scapy.all import *
+from scapy.layers.tls.session import TLSSession       # pip install scapy[tls]
+from scapy.sessions import IPSession, TCPSession
+
+# ---------------------------  CLI EXTENSIONS  ---------------------------------
+def extend_parser(p):
+    g = p.add_argument_group("advanced features")
+    g.add_argument("--tlskey", help="RSA key or key-log file for TLS decryption")
+    g.add_argument("--kafka", metavar="HOST:PORT", help="Kafka broker to stream JSON")
+    g.add_argument("--async", action="store_true", help="use AsyncSniffer")
+    g.add_argument("--plugin", metavar="DIR", help="auto-load extra parsers")
+    g.add_argument("--sip", action="store_true", help="enable SIP plugin (example)")
+    return p
+
+# ---------------------------  TLS DECRYPTION  ---------------------------------
+class TLSHandler:
+    def __init__(self, keyfile):
+        self.key = self._load_key(keyfile)
+        # tell Scapy to use our key
+        conf.tls_session_enable = True
+        conf.tls_nss_filename = keyfile if keyfile.endswith(".log") else None
+        conf.tls_private_key = keyfile if not keyfile.endswith(".log") else None
+
+    @staticmethod
+    def _load_key(f):
+        if not os.path.isfile(f):
+            raise FileNotFoundError(f"TLS key {f}")
+        return f
+
+    def decrypt(self, pkt):
+        if pkt.haslayer(TLS) or (TCP in pkt and pkt[TCP].dport in (443, 8443)):
+            # Scapy will auto-decrypt if key matches
+            return pkt
+        return pkt
+
+# ---------------------------  KAFKA SINK  -------------------------------------
+class KafkaSink:
+    def __init__(self, broker):
+        self.producer = KafkaProducer(
+            bootstrap_servers=broker,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            api_version_auto_timeout_ms=5000)
+
+    def send(self, pkt):
+        j = pkt2dict(pkt)
+        self.producer.send("pcap", j)
+
+# ---------------------------  PLUGIN LOADER  ----------------------------------
+class PluginManager:
+    def __init__(self, plugdir):
+        self.plugdir = pathlib.Path(plugdir)
+        self.hooks = {"tcp": [], "udp": [], "ip": []}
+        self._load_all()
+
+    def _load_all(self):
+        for py in self.plugdir.glob("*.py"):
+            try:
+                spec = importlib.util.spec_from_file_location(py.stem, py)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                # module must expose register(hooks_dict)
+                if hasattr(mod, "register"):
+                    mod.register(self.hooks)
+                    print(f"[+] loaded plugin {py.stem}")
+            except Exception as e:
+                logging.exception(f"plugin {py} failed")
+
+    def run(self, pkt):
+        L = []
+        if IP in pkt:   L += self.hooks["ip"]
+        if TCP in pkt:  L += self.hooks["tcp"]
+        if UDP in pkt:  L += self.hooks["udp"]
+        for func in L:
+            try:
+                func(pkt)
+            except Exception:
+                logging.exception("plugin error")
+
+# ---------------------------  ASYNC SNIFFER  ----------------------------------
+async def async_sniff(args, q, stop):
+    from scapy.arch.bpf.supersocket import AsyncNativeSocket
+    # requires Scapy ≥2.5
+    sniff_opened = AsyncNativeSocket(iface=args.iface, promisc=args.promisc)
+    pkt_reader = sniff_opened.sniff()
+    while not stop.is_set():
+        try:
+            pkt = await asyncio.wait_for(pkt_reader.__anext__(), timeout=1)
+            q.put(pkt)
+        except asyncio.TimeoutError:
+            continue
+
+# ---------------------------  SIP PLUGIN EXAMPLE  -----------------------------
+# save as plugins/sip_parser.py
+"""
+def register(hooks):
+    hooks["udp"].append(parse_sip)
+
+def parse_sip(pkt):
+    if UDP in pkt and pkt[UDP].dport == 5060:
+        sip = pkt[UDP].payload
+        if b"SIP/2.0" in bytes(sip)[:12]:
+            print(f"[SIP] {pkt[IP].src} → {pkt[IP].dst}  {bytes(sip).split(b'\\r\\n')[0]}")
+"""
+
+# ---------------------------  PATCHED SNIFFER  --------------------------------
+class SnifferPlus:
+    def __init__(self, args):
+        self.args = args
+        self.writer = RotatingWriter(args.out, args.rotate) if args.rotate else None
+        self.exporter = JSONExporter(args.export) if args.export else None
+        self.streamer = StreamHandler() if args.reassemble else None
+        self.tls = TLSHandler(args.tlskey) if args.tlskey else None
+        self.kafka = KafkaSink(args.kafka) if args.kafka else None
+        self.plugins = PluginManager(args.plugin) if args.plugin else None
+        self.q = queue.Queue(maxsize=20000)
+        self.stop_evt = threading.Event()
+
+    def start(self):
+        if self.args.async:
+            asyncio.run(self._async_loop())
+        else:
+            self._sync_loop()
+
+    # -------------  ASYNC BRANCH  -------------
+    async def _async_loop(self):
+        from scapy.arch.bpf.supersocket import AsyncNativeSocket
+        sock = AsyncNativeSocket(iface=self.args.iface, promisc=True)
+        async for pkt in sock.sniff():
+            if self.stop_evt.is_set():
+                break
+            self._handle(pkt)
+
+    # -------------  SYNC BRANCH  --------------
+    def _sync_loop(self):
+        for _ in range(self.args.workers):
+            threading.Thread(target=self.worker, daemon=True).start()
+        sniff(iface=self.args.iface,
+              filter=self.args.bpf,
+              prn=self.q.put,
+              store=False,
+              session=IPSession if self.args.reassemble else None,
+              stop_filter=lambda _: self.stop_evt.is_set())
+
+    def worker(self):
+        while not self.stop_evt.is_set():
+            try:
+                pkt = self.q.get(timeout=.5)
+            except queue.Empty:
+                continue
+            self._handle(pkt)
+
+    def _handle(self, pkt):
+        if self.tls:
+            pkt = self.tls.decrypt(pkt)
+        if self.writer:
+            self.writer.write(pkt)
+        if self.exporter:
+            self.exporter.handle(pkt)
+        if self.kafka:
+            self.kafka.send(pkt)
+        if self.plugins:
+            self.plugins.run(pkt)
+        if not self.args.quiet:
+            PrettyPrinter.handle(pkt)
+
+    def shutdown(self, sig, frame):
+        print("\n[*] shutting down…")
+        self.stop_evt.set()
+        sys.exit(0)
+
+# ---------------------------  MAIN  -------------------------------------------
+if __name__ == "__main__":
+    parser = extend_parser(argparse.ArgumentParser(description="Advanced sniffer+"))
+    args = parser.parse_args()
+    sniffer = SnifferPlus(args)
+    signal.signal(signal.SIGINT, sniffer.shutdown)
+    sniffer.start()
